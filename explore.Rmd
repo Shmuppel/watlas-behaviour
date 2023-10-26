@@ -1,0 +1,132 @@
+---
+title: "explore"
+author: "Niels van der Vegt"
+date: "2023-10-04"
+output: html_document
+---
+
+```{r install_packages, message=FALSE}
+install.packages("devtools")
+install.packages('bit64')
+devtools::install_github("shmuppel/tools4watlas")
+```
+
+```{r load_packages, message=FALSE}
+library(tools4watlas)
+library(glue)
+library(ggplot2)
+```
+
+Types of movement error:
+Small scale offsets to individual X and Y (small random measurement error)
+Large scale offsets to individual X and Y (large random measurement error, spikes)
+Large scale offsets to segments of X and Y (large scale consistent measurement error) 
+Missing data
+
+_median_filter5-variance_filter5000-delay_from_release24h
+
+##
+Types of filters:
+Temporal (only certain times, not applicable in our case)
+Spatial (only certain region, we can create bounds for richel/griend)
+
+##
+Standard deviation can be calculated from the variance-covariance matrix of each position
+SD = Sqrt(VarX + VarY + CovXY)
+Number of base stations involved in the localisation is also a good indicator (and single integer, good for model?)
+
+## Biologically implausible movement
+Have a look at the Dunlin videos and compare them to the WATLAS tracks to get 
+a feeling for what kind of errors may be present.
+
+High speed before and after is often a spike.
+But speed is scale dependent (speed will most likely be overestimated in high
+throughput localisations, as the movement of the animal is less than the 
+localisation error). Another argument for aggregate/subsample thinning
+
+Optimal level of thinning would be difficult to establish if there is a large 
+amount of individual variation
+
+Users who need uniformly sampled data can undertake data thinning by:
+aggregation
+subsampling
+
+Leave errors in, apply state space model
+- but we need a measurement for the error, and our error is a matrix in space
+
+Take all the errors out, apply HMM
+
+
+```{r}
+data <- atl_get_data_csv("data/dunlin-2022-2023/dunlin-2950.csv")
+```
+
+```{r}
+# Speed 'in' is speed from i-1 to i, use this for behavior
+data$speed_in <- atl_get_speed(data=data, time="TIME", type = "in") 
+data$speed_out <- atl_get_speed(data=data, time="TIME", type = "out") 
+data$angle <- atl_turning_angle(data=data, time="TIME") 
+```
+
+```{r}
+VARmax <- 2000 # variance in meters squared
+speed_max <- 30 # meters per second
+
+data <- atl_filter_covariates(
+  data=data,
+  filters = c(
+    "VARX < VARmax", 
+    "VARY < VARmax",
+    "speed_in < speed_max",
+    "speed_out < speed_max" 
+    )
+  )
+```
+
+```{r}
+thinned_data <- atl_thin_data(
+  data, 
+  interval = 30, 
+  id_columns = c("tag"),
+  method="aggregate"
+)
+```
+
+```{r}
+hist(thinned_data$angle)
+```
+
+```{r}
+median(data$speed_in)
+median(thinned_data$speed_in)
+```
+
+
+```{r}
+data_spatial <- atlas_make_spatialdataframe(thinned_data)
+atl_plot_tag(data_spatial, tag=NULL, fullname=NULL, buffer=0.1, color_by="time")
+```
+
+
+```{r}
+#> Obtain the extent of tracking data for retrieving the satellite imagery
+bbox_utm <- atl_get_spatial_bounds(data_spatial)
+
+#> Transform the bounding box to the osm coordinate reference system
+bbox_osm <- atlas_make_boundingbox_for_osm(bbox_utm, buffer=70, from_crs=sp::CRS("+init=epsg:32631"))
+
+#> Download the map from OpenStreetMap using the bounding box
+map <- OpenStreetMap::openmap(bbox_osm[1,], bbox_osm[2,], type='bing')
+
+#> Transform tracking data to the osm() coordinate reference system
+data_spatial_osm <- sp::spTransform(data_spatial, OpenStreetMap::osm()) 
+
+#> plot the tracking data on the satellite image
+atl_plot_tag_osm(data=data_spatial_osm, tag=NULL, mapID=map, color_by="time", 
+            fullname=NULL, Scalebar=3)
+```
+
+
+
+
+

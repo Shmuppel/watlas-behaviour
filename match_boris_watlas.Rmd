@@ -1,0 +1,110 @@
+---
+title: "match_boris_watlas"
+author: "Niels van der Vegt"
+date: "2023-10-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE}
+library(lubridate)
+library(testit)
+library(exifr)
+library(stars)
+library(sf)
+library(ggplot2)
+```
+
+```{r}
+exif <- read_exif("validation/dunlins/07-09-2023_dunlin3226-1.MOV")
+```
+
+```{r}
+behaviour_dict <- c(
+  "pecking"="active", 
+  "probing"="active", 
+  "hunting"="active",
+  "hunting prey"="active",
+  "probing prey"="active",
+  "interaction"="active",
+  "walking"="active",
+  "foraging"="active",
+  
+  "vigilant"="inactive",
+  "preening"="inactive",
+  "hopping"="inactive",
+  
+  "camera malfunction"="-"
+)
+```
+
+Import observation date from timestamp as datetime
+get interval between observation date - date + last recorded time
+get interval from watlas data
+
+r hashmap for behaviours
+add behaviour to each data point in watlas data
+save watlas interval to new location
+
+## Parse BORIS observation
+```{r}
+observations <- read.csv('resources/timestamps/20220806_Y1YRNY_2960.csv', sep=';')
+observation_start <- observations[6,2]  # get observation date from metadata
+observation_start <- ymd_hms(observation_start, tz="Europe/Amsterdam")
+observation_long <- observations[7,2]
+observation_lat <- observations[8,2]
+colnames(observations) <- observations[17,]  # get colnames from metadata
+observations <- observations[-c(1:17),]  # remove metadata from df
+```
+
+```{r}
+observations$Time <- seconds(observations$Time) + observation_start
+observations <- observations[observations$Status != 'START',]
+```
+
+
+## Parse WATLAS 
+```{r}
+watlas <- read.csv('resources/watlas/dunlin-2022-2023/dunlin-2960.csv')
+watlas$time <- ymd_hms(watlas$time, tz="UTC")
+watlas$time <- with_tz(watlas$time, tzone = "Europe/Amsterdam")
+watlas_interval <- interval(watlas[1, "time"], watlas[nrow(watlas), "time"])
+assert(int_overlaps(observation_interval, watlas_interval))
+```
+
+# Coordinate Check
+```{r}
+overlap <- setdiff(observation_interval, watlas_interval)
+watlas <- watlas[watlas$time %within% overlap,]
+observations <- observations[observations$Time %within% overlap,]
+assert(nrow(watlas) != 0 && nrow(observations) != 0)
+```
+
+```{r}
+# Probably change this with dplyr lead
+t <- sapply(1:nrow(observations), function(i) interval(observations[i,]$Time, observations[i+1,]$Time))
+```
+
+```{r}
+watlas$behaviour <- sapply(watlas$time, FUN=function(time) {
+  x <- observations$Time - time
+  x <- x[x <= 0]
+  closest_observation <- observations[which.min(abs(x)), ]
+  return(as.character(behaviour_dict[closest_observation$Behavior]))
+})
+```
+
+```{r}
+watlas_sf <- st_as_sf(watlas, coords = c("X","Y"))
+watlas_sf <- st_set_crs(watlas_sf, 32631) 
+```
+
+```{r}
+plot(watlas_sf["behaviour"])
+
+```
+
+
