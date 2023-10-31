@@ -22,10 +22,6 @@ library(dplyr)
 ```
 
 ```{r}
-exif <- read_exif("validation/dunlins/07-09-2023_dunlin3226-1.MOV")
-```
-
-```{r}
 behaviour_dict <- c(
   "pecking"="active", 
   "probing"="active", 
@@ -135,15 +131,9 @@ for (file in files) {
 validation_data <- validation_data[validation_data$behaviour != 'camera malfunction',]
 ```
 
-
 ```{r}
-watlas_sf <- st_as_sf(validation_data, coords = c("X","Y"))
-watlas_sf <- st_set_crs(watlas_sf, 32631) 
+write.table(validation_data, 'resources/validation_data.csv', sep=';')
 ```
 
-```{r}
-ggplot() + 
-  geom_sf(data = watlas_sf, mapping=aes(color=behaviour))
-```
 
 
