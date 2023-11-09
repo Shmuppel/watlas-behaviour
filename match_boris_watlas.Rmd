@@ -22,7 +22,18 @@ library(dplyr)
 ```
 
 ```{r}
+ex <- read_exif('resources/videos/2023/dunlins/12-09-2023_dunlin3206-2.MOV')
+```
+
+```{r}
+ex$CreationDate
+ex$GPSLatitude
+ex$GPSLongitude
+```
+
+```{r}
 behaviour_dict <- c(
+  "active"="active",
   "pecking"="active", 
   "probing"="active", 
   "hunting"="active",
@@ -32,13 +43,21 @@ behaviour_dict <- c(
   "walking"="active",
   "foraging"="active",
   "unknown prey"="active",
+  "fluttering"="active",
+  "pecking prey"="active",
+  "sweeping"="active",
   
+  "inactive"="inactive",
   "vigilant"="inactive",
   "preening"="inactive",
   "hopping"="inactive",
   "sleeping"="inactive",
   "scratching"="inactive",
   "standing still"="inactive",
+  "defacating"="inactive",
+  "bathing"="inactive",
+  "vomiting"="inactive",
+  "stretching"="inactive",
   
   "flying"="flying",
   
@@ -58,9 +77,28 @@ preprocess_observation <- function(observation_path) {
   colnames(observation) <- observation[6,]  # get colnames from metadata
   observation_data <- observation[-c(1:6),]  # remove metadata from df
   
-  # Body preprocessing
+  # translate the detailed behaviours into active/inactive/flying
+  # change the BORIS time into a generic CEST timestamp
   observation_data$Time <- seconds(observation_data$Time) + observation_start
   observation_data <- observation_data[observation_data$Status != 'START',]
+  observation_data$Behavior <- sapply(observation_data$Behavior, function(behavior) {
+    return(as.character(behaviour_dict[behavior]))
+  })
+  
+  # if the last observation was a camera malfunction, just clip the behaviour 
+  # early, this is often assigned after the bird flies away and is out of sight
+  last_observation <- tail(observation_data, 1)
+  if (last_observation$Behavior == 'camera malfunction') {
+    observation_data <- head(observation_data, -1)
+  }
+  # if the last observation was flying, assume the bird flies a little longer,
+  # even though this is technically not observed.
+  last_observation <- tail(observation_data, 1)
+  if (last_observation$Behavior == 'flying') {
+    # TODO we could cut the based on speed later
+    observation_data[nrow(observation_data), 'Time'] <- last_observation$Time + 30
+  }
+  
   observation_end <- observation_data[nrow(observation_data), "Time"]
   observation_interval <- interval(observation_start, observation_end)
   
@@ -80,32 +118,105 @@ preprocess_observation <- function(observation_path) {
 
 ```{r}
 get_watlas_for_observation <- function(observation) {
-  watlas <- read.csv(
-    glue('resources/watlas/dunlin-2022-2023/dunlin-{tag}.csv', tag=observation$tag)
-  )
-  watlas$time <- ymd_hms(watlas$time, tz="UTC")
+  watlas <- read.csv(glue(
+    'resources/watlas/dunlin-2022-2023/dunlin-{tag}.csv',
+    tag = observation$tag
+  ))
+  watlas$time <- ymd_hms(watlas$time, tz = "UTC")
   watlas$time <- with_tz(watlas$time, tzone = "Europe/Amsterdam")
-  watlas_interval <- interval(watlas[1, "time"], watlas[nrow(watlas), "time"])
+  watlas_interval <-
+    interval(watlas[1, "time"], watlas[nrow(watlas), "time"])
   
-  tryCatch({
-    watlas$speed_in <- atl_get_speed(data=watlas, time="TIME", type = "in") 
-    watlas$angle <- atl_turning_angle(data=watlas, time="TIME") 
-  },
-    warning=function(cond) message(paste("Warning during feature calculation:", cond$message))
+  # create speed features
+  watlas$speed_in <-
+    atl_get_speed(
+      data = watlas,
+      time = "TIME",
+      type = "in",
+      X = "X_raw",
+      Y = "Y_raw"
+    )
+  watlas$speed_out <-
+    atl_get_speed(
+      data = watlas,
+      time = "TIME",
+      type = "out",
+      X = "X_raw",
+      Y = "Y_raw"
+    )
+  # create turning angle feature
+  watlas$angle <- atl_turning_angle(data = watlas,
+                                    time = "TIME",
+                                    X = "X_raw",
+                                    Y = "Y_raw")
+  # create delta time feature, which is the time difference in seconds
+  # basically, how many seconds passed since the last localisation
+  watlas$dtime <- sapply(
+    1:nrow(watlas),
+    FUN = function(i) {
+      if (i == 1) return(0)
+      return(watlas[i, "time"] - watlas[i - 1, "time"])
+    }
   )
   
+  # find the overlap between the observation and the watlas data
+  # then only keep the watlas localisations that were within the timeframe
+  # of the observation
   overlap <- setdiff(observation$interval, watlas_interval)
-  watlas <- watlas[watlas$time %within% overlap,]
+  watlas <- watlas[watlas$time %within% overlap, ]
   
+  # if there were no localisations during the observation, exit early
   if (nrow(watlas) == 0) return(NULL)
   
-  watlas$behaviour <- sapply(watlas$time, FUN=function(time) {
-    x <- time - observation$data$Time
-    x <- x[x <= 0]
-    closest_observation <- observation$data[which.min(abs(x)), ]
-    return(as.character(behaviour_dict[closest_observation$Behavior]))
-  })
-  
+  # link a behaviour to a watlas localisation
+  watlas$behaviour <- sapply(
+    1:nrow(watlas),
+    FUN = function(i) {
+      # start is the the time of the previous watlas localisation
+      x_start <- watlas[i, "time"] - watlas[i, "dtime"]
+      # end is this localisation
+      x_end <- watlas[i, "time"]
+      x_interval <- interval(x_start, x_end)
+      # find what behaviour (if any) has been observed since the last localisation
+      x_entries <-
+        observation$data[observation$data$Time %within% x_interval,]
+      # if flying was observed, this observation should be flying
+      # this is because the large changes in speed and location during this behavior
+      # TODO feedback on this
+      if ("flying" %in% x_entries$Behavior) return("flying")
+      
+      # if one or multiple behaviours have been observed, the behaviour we assign to
+      # this localisation is the behaviour that was the most common 
+      # (i.e. observed the longest)
+      if (nrow(x_entries) > 0) {
+        x_behaviours <- c("active" = 0, "inactive" = 0, "camera malfunction" = 0)
+        # start counting up the total amount of seconds for each behaviour
+        for (j in 1:nrow(x_entries)) {
+          if (j == 1) {
+            secs <- seconds(x_entries[j, "Time"] - x_start)
+          } else {
+            secs <- seconds(x_entries[j, "Time"] - x_entries[j - 1, "Time"])
+          }
+          x_behaviours[x_entries[j, "Behavior"]] <-
+            x_behaviours[[x_entries[j, "Behavior"]]] + secs
+        }
+        # return the behavior with the most seconds
+        most_frequent_behaviour <- names(x_behaviours[x_behaviours == max(x_behaviours)])
+        return(most_frequent_behaviour)
+      
+      # else if there was no observation since the last localisation, that means
+      # that we're in the middle of a BORIS START - STOP interval, and the 
+      # observation STOP is after this localisation
+      } else {
+        # find the first following observed behaviour relative to this localisation 
+        x <- watlas[i, "time"] - observation$data$Time
+        closest <- min(abs(x[x <= 0]))
+        closest_observation <-
+          observation$data[which(x == -closest), ][1,]
+        return(closest_observation$Behavior)
+      }
+    }
+  )
   return(watlas)
 }
 ```
@@ -121,14 +232,26 @@ for (file in files) {
   watlas <- get_watlas_for_observation(observation)
   
   if (!is.null(watlas)) {
+    watlas$observation_path <- file
     validation_data <- bind_rows(validation_data, watlas)
-    observations <- append(observations, observation)
+    observations[[file]] <- observation
   }
 }
 ```
 
+# Filtering
 ```{r}
-validation_data <- validation_data[validation_data$behaviour != 'camera malfunction',]
+# Remove very unlikely speeds
+speed_max <- 120
+validation_data <- validation_data[validation_data$speed_in < speed_max,]
+validation_data <- validation_data[validation_data$speed_out < speed_max,]
+
+# If camera malfunction was the most likely behavior, we don't know what happend at that WATLAS point, so we remove it
+print(
+  glue("Removed {n} number of localisations because of camera malfunction",
+  n=nrow(validation_data[validation_data$behaviour == "camera malfunction",]))
+)
+validation_data <- validation_data[validation_data$behaviour != "camera malfunction",]
 ```
 
 ```{r}
