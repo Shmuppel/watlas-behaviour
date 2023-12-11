@@ -141,10 +141,14 @@ get_properties <- function(
   watlas$dtime <- sapply(
     1:nrow(watlas),
     FUN = function(i) {
-      if (i == 1) return(0)
+      if (i == 1) return(0)  # TODO this should be NA
       return(watlas[i, "time"] - watlas[i - 1, "time"])
     }
   )
+  # step length
+  watlas_sf <- st_as_sf(watlas, coords=c(x, y), crs=st_crs(32631))
+  distance <- st_distance(head(watlas_sf, -1), tail(watlas_sf, -1), by_element=T)
+  watlas$step_length <- c(NA, distance)
   return(watlas)
 }
 

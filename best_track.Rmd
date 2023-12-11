@@ -1,0 +1,191 @@
+---
+title: "best_track"
+author: "Niels van der Vegt"
+date: "2023-12-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tools4watlas)
+library(ggspatial)
+library(ggplot2)
+library(sfheaders)
+library(sf)
+library(fitdistrplus)
+library(gridExtra)
+library(momentuHMM)
+source('util.R')
+```
+
+```{r}
+land_sf <- st_as_sf(land)
+mudflats_sf <- st_as_sf(mudflats)
+```
+
+```{r}
+validation_data <- read.csv('resources/validation_data.csv', sep=';')
+validation_data$time <- as.POSIXct(validation_data$time, tz="Europe/Amsterdam")
+```
+
+```{r}
+track <- validation_data[validation_data$observation_path == unique(validation_data$observation_path)[54],]
+```
+
+```{r}
+track_m3 <- atl_median_smooth(data = track, time = "TIME", X = "X_raw", Y = "Y_raw", moving_window = 3)
+track_m3 <- get_properties(track_m3)
+```
+
+```{r}
+track_sf <- st_as_sf(track, coords=c("X_raw", "Y_raw"), crs=st_crs(32631))
+track_sf_m3 <-st_as_sf(track_m3, coords=c("X", "Y"), crs=st_crs(32631))
+```
+
+```{r}
+plot_path <- ggplot() +
+  layer_spatial(track_sf, aes(col = pure_behaviour), size=1, alpha=0.5)
+plot_path_m3 <- ggplot() +
+  layer_spatial(track_sf_m3, aes(col = pure_behaviour), size=1, alpha=0.5)
+grid.arrange(plot_path, plot_path_m3, nrow=2)
+```
+# Pure behaviour characteristics 
+```{r}
+pure_active <- track_m3[track_m3$pure_behaviour == 'active',]
+pure_inactive <- track_m3[track_m3$pure_behaviour == 'inactive',]
+pure_mixed <- track[track$pure_behaviour == 'mixed',]
+
+fit.pure_active <- fitdist(pure_active$step_length, distr = "gamma", method = "mle")
+fit.pure_inactive <- fitdist(pure_inactive$step_length, distr = "gamma", method = "mle")
+```
+
+```{r}
+get_step_length_dist <- function(track) {
+  pure_active <- na.omit(track[track$pure_behaviour == 'active',])
+  pure_inactive <- na.omit(track[track$pure_behaviour == 'inactive',])
+  mixed <- na.omit(track[track$pure_behaviour == 'mixed',])
+  
+  fit.pure_active <- fitdist(pure_active$step_length + 0.0001, distr = "gamma", method = "mle")
+  fit.pure_inactive <- fitdist(pure_inactive$step_length + 0.0001, distr = "gamma", method = "mle")
+  fit.mixed <- fitdist(pure_mixed$step_length + 0.001, distr = "gamma", method = "mle")
+  
+  return(
+    list(
+      pure_active=fit.pure_active,
+      pure_inactive=fit.pure_inactive,
+      mixed=fit.mixed
+    )
+  )
+}
+```
+
+```{r}
+fit_track <- get_step_length_dist(track)
+fit_track_m3 <- get_step_length_dist(track_m3)
+
+get_step_length_plot <- function(track, fit_track) {
+  return(
+    ggplot(data=track, aes(x=step_length)) + 
+  geom_histogram(
+    data=track[track$pure_behaviour == 'inactive',], 
+    aes(y=after_stat(density)), 
+    alpha=0.5, 
+    fill='blue') +
+  geom_histogram(
+    data=track[track$pure_behaviour == 'active',],
+    aes(y=after_stat(density)), 
+    alpha=0.5, 
+    fill='red') +
+  stat_function(
+    colour="red", 
+    size=1.25, 
+    fun=dgamma, 
+    args=list(shape=fit_track$pure_active$estimate[1], rate=fit_track$pure_active$estimate[2])) +
+  stat_function(
+    colour="blue", 
+    size=1.25, 
+    fun=dgamma, 
+    args=list(shape=fit_track$pure_inactive$estimate[1], rate=fit_track$pure_inactive$estimate[2]))
+  )
+}
+
+track_plot <- get_step_length_plot(track, fit_track)
+track_m3_plot <- get_step_length_plot(track_m3, fit_track_m3)
+grid.arrange(track_plot, track_m3_plot, nrow=2)
+```
+
+```{r}
+
+```
+
+```{r}
+# select and rename relevant columns
+rawData <- track[,c("tag","time","X","Y", "speed_in")]
+colnames(rawData) <- c("ID","time","x","y", "speed_in")
+
+crwOut<-crawlWrap(
+  rawData,
+  timeStep="8 secs",
+  #theta=c(6.855, -0.007),
+  fixPar=c(NA,NA)
+)
+plot(crwOut,ask=FALSE)
+hmmData <- prepData(data=crwOut)
+
+stateNames <- c("active","inactive")
+# distributions for observation processes
+dist = list(
+  step = "gamma", 
+  angle = "wrpcauchy",
+  speed_in = "gamma"
+)
+# initial parameters
+Par0_m1 <- list(
+  step=c(
+    8.26, 2.52,  # mean
+    1.73, 1.96,  # standard deviation
+    0.0001, 0.0001
+  ),
+  angle=c(
+    0.5,
+    0.1
+  ),
+  speed_in=c(
+    0.05, 0.2,
+    0.1, 0.4
+  )
+)
+
+# fit model
+m1 <- fitHMM(
+  data = hmmData, 
+  nbStates = 2, 
+  dist = dist, 
+  Par0 = Par0_m1, 
+  stateNames = stateNames
+)
+
+# decode most likely state sequence
+states <- viterbi(m1)
+# derive percentage of time spent in each state
+table(states)/nrow(hmmData)
+
+# plot results for model m3
+plot(m1)
+
+# plot satellite image for model m3
+plotSat(
+  m1,
+  zoom=8,
+  col=c("firebrick3","seagreen4"),
+  projargs = proj4string(utmcoord),ask=FALSE
+)
+# compute pseudo-residuals for the steps and the angles
+pr <- pseudoRes(m1)
+# plot the ACF of step pseudo-residuals
+acf(pr$stepRes[!is.na(pr$stepRes)],lag.max = 300)
+```
+
