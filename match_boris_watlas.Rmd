@@ -12,23 +12,12 @@ knitr::opts_chunk$set(echo = TRUE)
 ```{r message=FALSE}
 library(lubridate)
 library(testit)
-library(exifr)
 library(stars)
 library(sf)
 library(ggplot2)
 library(tools4watlas)
 library(glue)
 library(dplyr)
-```
-
-```{r}
-ex <- read_exif('resources/videos/2023/dunlins/12-09-2023_dunlin3206-2.MOV')
-```
-
-```{r}
-ex$CreationDate
-ex$GPSLatitude
-ex$GPSLongitude
 ```
 
 ```{r}
@@ -67,7 +56,7 @@ behaviour_dict <- c(
 
 ```{r}
 preprocess_observation <- function(observation_path) {
-  # Metadata preprocessing
+  # metadata preprocessing
   observation <- read.csv(observation_path, sep=';')
   observation_start <- observation[1,2]  # get observation date from metadata
   observation_start <- ymd_hms(observation_start, tz="Europe/Amsterdam")
@@ -91,6 +80,7 @@ preprocess_observation <- function(observation_path) {
   if (last_observation$Behavior == 'camera malfunction') {
     observation_data <- head(observation_data, -1)
   }
+  
   # if the last observation was flying, assume the bird flies a little longer,
   # even though this is technically not observed.
   last_observation <- tail(observation_data, 1)
@@ -117,38 +107,35 @@ preprocess_observation <- function(observation_path) {
 ```
 
 ```{r}
-get_watlas_for_observation <- function(observation) {
-  watlas <- read.csv(glue(
-    'resources/watlas/dunlin-2022-2023/dunlin-{tag}.csv',
-    tag = observation$tag
-  ))
-  watlas$time <- ymd_hms(watlas$time, tz = "UTC")
-  watlas$time <- with_tz(watlas$time, tzone = "Europe/Amsterdam")
-  watlas_interval <-
-    interval(watlas[1, "time"], watlas[nrow(watlas), "time"])
-  
-  # create speed features
+get_properties <- function(
+    watlas,
+    x='X_raw',
+    y='Y_raw'
+  ) {
+  # speed
   watlas$speed_in <-
     atl_get_speed(
       data = watlas,
       time = "TIME",
       type = "in",
-      X = "X_raw",
-      Y = "Y_raw"
+      X = x,
+      Y = y
     )
   watlas$speed_out <-
     atl_get_speed(
       data = watlas,
       time = "TIME",
       type = "out",
-      X = "X_raw",
-      Y = "Y_raw"
+      X = x,
+      Y = y
     )
-  # create turning angle feature
-  watlas$angle <- atl_turning_angle(data = watlas,
-                                    time = "TIME",
-                                    X = "X_raw",
-                                    Y = "Y_raw")
+  # turning angle
+  watlas$angle <- 
+    atl_turning_angle(
+      data = watlas,
+      time = "TIME",
+      X = x,
+      Y = y)
   # create delta time feature, which is the time difference in seconds
   # basically, how many seconds passed since the last localisation
   watlas$dtime <- sapply(
@@ -158,65 +145,129 @@ get_watlas_for_observation <- function(observation) {
       return(watlas[i, "time"] - watlas[i - 1, "time"])
     }
   )
+  return(watlas)
+}
+
+get_behaviour <- function(watlas, observation) {
+    watlas[,c("active", "inactive", "flying", "behaviour", "pure_behaviour")] <- t(sapply(
+    1:nrow(watlas),
+    FUN = function(i) {
+      # TODO don't like initialising a function 1000s of times, clean up
+      get_next_closest_observation <- function() {
+        x <- watlas[i, "time"] - observation$data$Time
+        closest <- min(abs(x[x <= 0]))
+        closest_observation <- observation$data[which(x == -closest), ][1,]
+        return(closest_observation)
+      }
+      
+      # start is the the time of the previous watlas localisation
+      x_start <- watlas[i, "time"] - watlas[i, "dtime"]
+      # end is this localisation
+      x_end <- watlas[i, "time"] 
+      x_interval <- interval(x_start, x_end)
+      x_next_observation <- get_next_closest_observation()
+      
+      # x entries should be:
+      # any observations between the last localisation, and the current localisation
+      # in case the current localisation is a part of an observation that stops later
+      # include the next observation too
+      x_entries <- rbind(
+        observation$data[observation$data$Time %within% x_interval,],
+        x_next_observation
+      )
+      
+      # if one or multiple behaviours have been observed, the behaviour we assign to
+      # this localisation is the behaviour that was the most common 
+      # (i.e. observed the longest)
+      x_behaviours <- c(
+        "active" = 0, 
+        "inactive" = 0, 
+        "flying" = 0,
+        "camera malfunction" = 0
+      )
+      
+      # if the number of entries is one, we only have the next observation
+      # and no individual observations were present in between
+      if (nrow(x_entries) == 1) {
+        secs <- seconds(x_end - x_start)
+        x_behaviours[x_entries[1, "Behavior"]] <- x_behaviours[[x_entries[1, "Behavior"]]] + secs
+      # start counting up the total amount of seconds for each behaviour
+      } else {
+        for (j in 1:nrow(x_entries)) {
+          if (j == 1) {
+            secs <- seconds(x_entries[j, "Time"] - x_start)
+          } else if (j == nrow(x_entries)) {
+            secs <- seconds(x_end - x_entries[j - 1, "Time"])
+          } else {
+            secs <- seconds(x_entries[j, "Time"] - x_entries[j - 1, "Time"])
+          }
+          x_behaviours[x_entries[j, "Behavior"]] <- x_behaviours[[x_entries[j, "Behavior"]]] + secs
+        }
+      }
+      
+      # if flying was observed, this observation should be flying
+      # this is because the large changes in speed and location during this behavior
+      # TODO feedback on this
+      if (x_behaviours[["flying"]] > 0) {
+        behaviour <- "flying"
+      } else {
+        # else, most common behaviour
+        behaviour <- names(x_behaviours[x_behaviours == max(x_behaviours)]) 
+      }
+      
+      # pure behaviour, if only one behaviour was observed, else mixed
+      pure_behaviour <- 'mixed'
+      if (sum(x_behaviours) == x_behaviours[['active']]) pure_behaviour <- 'active'
+      if (sum(x_behaviours) == x_behaviours[['inactive']]) pure_behaviour <- 'inactive'
+      if (sum(x_behaviours) == x_behaviours[['flying']]) pure_behaviour <- 'flying'
+      
+      return(
+        c(
+          x_behaviours[["active"]],
+          x_behaviours[["inactive"]],
+          x_behaviours[["flying"]],
+          behaviour,
+          pure_behaviour
+        )
+      )
+    }
+  ))
+  
+  # this is why I sometimes dislike R, can't even return arguments of
+  # multiple types unless you want to unpack a named list nightmare
+  watlas$active <- as.numeric(watlas$active)
+  watlas$inactive <- as.numeric(watlas$inactive)
+  watlas$flying <- as.numeric(watlas$flying)
+  return(watlas)
+}
+
+
+get_watlas_for_observation <- function(
+    observation,
+    aggregate=F
+  ) {
+  watlas <- read.csv(glue(
+    'resources/watlas/dunlin-all/dunlin-{tag}.csv',
+    tag = observation$tag
+  ))
+  watlas$time <- ymd_hms(watlas$time, tz = "UTC")
+  watlas$time <- with_tz(watlas$time, tzone = "Europe/Amsterdam") # same tz as observation
+  watlas_interval <- interval(watlas[1, "time"], watlas[nrow(watlas), "time"])
+  
+  # create properties
+  watlas <- get_properties(watlas, x='X_raw', y='Y_raw')
   
   # find the overlap between the observation and the watlas data
   # then only keep the watlas localisations that were within the timeframe
   # of the observation
   overlap <- setdiff(observation$interval, watlas_interval)
   watlas <- watlas[watlas$time %within% overlap, ]
-  
   # if there were no localisations during the observation, exit early
   if (nrow(watlas) == 0) return(NULL)
   
-  # link a behaviour to a watlas localisation
-  watlas$behaviour <- sapply(
-    1:nrow(watlas),
-    FUN = function(i) {
-      # start is the the time of the previous watlas localisation
-      x_start <- watlas[i, "time"] - watlas[i, "dtime"]
-      # end is this localisation
-      x_end <- watlas[i, "time"]
-      x_interval <- interval(x_start, x_end)
-      # find what behaviour (if any) has been observed since the last localisation
-      x_entries <-
-        observation$data[observation$data$Time %within% x_interval,]
-      # if flying was observed, this observation should be flying
-      # this is because the large changes in speed and location during this behavior
-      # TODO feedback on this
-      if ("flying" %in% x_entries$Behavior) return("flying")
-      
-      # if one or multiple behaviours have been observed, the behaviour we assign to
-      # this localisation is the behaviour that was the most common 
-      # (i.e. observed the longest)
-      if (nrow(x_entries) > 0) {
-        x_behaviours <- c("active" = 0, "inactive" = 0, "camera malfunction" = 0)
-        # start counting up the total amount of seconds for each behaviour
-        for (j in 1:nrow(x_entries)) {
-          if (j == 1) {
-            secs <- seconds(x_entries[j, "Time"] - x_start)
-          } else {
-            secs <- seconds(x_entries[j, "Time"] - x_entries[j - 1, "Time"])
-          }
-          x_behaviours[x_entries[j, "Behavior"]] <-
-            x_behaviours[[x_entries[j, "Behavior"]]] + secs
-        }
-        # return the behavior with the most seconds
-        most_frequent_behaviour <- names(x_behaviours[x_behaviours == max(x_behaviours)])
-        return(most_frequent_behaviour)
-      
-      # else if there was no observation since the last localisation, that means
-      # that we're in the middle of a BORIS START - STOP interval, and the 
-      # observation STOP is after this localisation
-      } else {
-        # find the first following observed behaviour relative to this localisation 
-        x <- watlas[i, "time"] - observation$data$Time
-        closest <- min(abs(x[x <= 0]))
-        closest_observation <-
-          observation$data[which(x == -closest), ][1,]
-        return(closest_observation$Behavior)
-      }
-    }
-  )
+  # get behaviour related columns
+  watlas <- get_behaviour(watlas, observation)
+  
   return(watlas)
 }
 ```
