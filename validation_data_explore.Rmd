@@ -1,0 +1,149 @@
+---
+title: "validation_data_explore"
+author: "Niels van der Vegt"
+date: "2023-10-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tools4watlas)
+library(ggspatial)
+library(sfheaders)
+library(sf)
+library(fitdistrplus)
+library(gridExtra)
+```
+
+```{r}
+validation_data <- read.csv('resources/validation_data.csv', sep=';')
+```
+
+```{r}
+count(validation_data, behaviour)
+```
+
+# Histogram of sequence lengths
+```{r}
+ggplot(
+  validation_data %>% count(observation_path, behaviour), 
+  aes(x=substr(observation_path, 26, 45), y=n, fill=behaviour)) +
+    geom_bar(stat = "identity", position="stack") +
+    labs(x = "Observation") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+)
+```
+# Spatial plot
+```{r}
+val_sf <- st_as_sf(validation_data, coords=c("X", "Y"), crs=st_crs(32631))
+land_sf <- st_as_sf(land)
+mudflats_sf <- st_as_sf(mudflats)
+```
+
+```{r}
+ggplot() +
+  annotation_spatial(land_sf, col="black", fill="grey49") +
+  annotation_spatial(mudflats_sf, col="grey49", fill="grey90") +
+  layer_spatial(val_sf, aes(col = behaviour))
+```
+# Distance between observations and first watlas point
+```{r}
+points_obs <- data.frame()
+points_wat <- data.frame() 
+for (observation in names(observations)) {
+  watlas <- validation_data[validation_data$observation_path == observation,]
+  obs <- observations[[observation]]
+  if (is.na(obs$lat)) next
+  
+  points_obs <- bind_rows(points_obs, c(X=obs$long, Y=obs$lat, id=obs$tag))
+  watlas_median <- median(1:nrow(watlas))
+  points_wat <- bind_rows(points_wat, c(X=watlas[watlas_median,]$X, Y=watlas[watlas_median,]$Y, id=obs$tag))
+}
+```
+
+```{r}
+points_obs <- points_obs[points_obs$id == 3208,]
+points_wat <- points_wat[points_wat$id == 3208,]
+points_obs <- st_as_sf(points_obs, coords=c('X','Y'), crs=4326)
+points_obs <- st_transform(points_obs, crs=st_crs(32631))
+points_wat <- st_as_sf(points_wat, coords=c('X','Y'), crs=32631)
+
+get_lines_from_points <- function(points_a, points_b) {
+  linestring_from_points <- function(a, b) st_cast(st_union(a,b), "LINESTRING")
+  return (
+    st_sfc(
+      mapply(
+        linestring_from_points, 
+        points_a$geometry, 
+        points_b$geometry, 
+        SIMPLIFY = F),
+      crs=32631
+    )
+  )
+}
+
+
+lines <- get_lines_from_points(points_obs$geometry, points_wat$geometry)
+```
+
+```{r}
+ggplot() +
+  annotation_spatial(land_sf, col="black", fill="grey49") +
+  annotation_spatial(mudflats_sf, col="grey49", fill="grey90") +
+  layer_spatial(points_obs, color="red", alpha=0.5) +
+  layer_spatial(points_wat, color="blue", alpha=0.5) +
+  layer_spatial(lines, color="orange")
+```
+
+```{r}
+df <- data.frame(distance=as.numeric(st_length(lines)))
+ggplot(data=df, aes(y=distance)) +
+  geom_boxplot() 
+```
+
+```{r}
+val_flying <- validation_data[validation_data$behaviour == "flying",]
+val_active <- validation_data[validation_data$behaviour == "active",]
+val_inactive <- validation_data[validation_data$behaviour == "inactive",]
+```
+
+```{r}
+ggplot(data=validation_data, aes(y=speed_in, fill=pure_behaviour)) +
+  geom_boxplot()
+```
+
+```{r}
+ggplot(data=best_track_comb, aes(y=speed_in, x=as.factor(window), fill=pure_behaviour)) +
+  geom_boxplot()
+```
+
+
+```{r}
+plot_tag <- function(data, x='X', y='Y') {
+  points <- st_as_sf(
+    data, 
+    coords=c(x, y),
+    crs=st_crs(32631)
+  )
+  
+  lines <- sfheaders::sf_linestring(
+    data,
+    x=x,
+    y=y
+  )
+  lines <- st_set_crs(lines, 32631)
+  
+  return (
+    ggplot() +
+      annotation_spatial(land_sf, col="black", fill="grey49") +
+      annotation_spatial(mudflats_sf, col="grey49", fill="grey90") +
+      layer_spatial(points, aes(col=behaviour)) +
+      layer_spatial(lines, aes(col='grey70'))
+  )
+}
+```

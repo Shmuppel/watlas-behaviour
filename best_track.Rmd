@@ -14,48 +14,203 @@ library(tools4watlas)
 library(ggspatial)
 library(ggplot2)
 library(sfheaders)
+library(sp)
+library(rgdal)
 library(sf)
 library(fitdistrplus)
 library(gridExtra)
+library(lubridate)
 library(momentuHMM)
 source('util.R')
+devtools::install_local("../momentuHMM_2.0.0.tar.gz") 
 ```
 
 ```{r}
+set.seed(12345)
 land_sf <- st_as_sf(land)
 mudflats_sf <- st_as_sf(mudflats)
 ```
 
 ```{r}
-validation_data <- read.csv('resources/validation_data.csv', sep=';')
-validation_data$time <- as.POSIXct(validation_data$time, tz="Europe/Amsterdam")
+preprocess_watlas <- function(watlas) {
+  watlas$time <- ymd_hms(watlas$time, tz = "UTC")
+  watlas$time <- with_tz(watlas$time, tzone = "Europe/Amsterdam")  # same tz as observations
+  watlas <- atl_thin_data(
+    watlas,
+    interval=24,
+    method="aggregate"
+  )
+  watlas <- get_properties(watlas, x='X', y='Y')
+  return(watlas)
+}
+dunlin <- read.csv('resources/watlas/dunlin-all/dunlin-3208.csv')
+dunlin <- preprocess_watlas(dunlin)
+day_interval <- interval(ymd_hms("2023-09-13 00:00:00"), ymd_hms("2023-09-13 23:59:59"))
+dunlin <- dunlin[dunlin$time %within% day_interval,]
 ```
 
 ```{r}
-track <- validation_data[validation_data$observation_path == unique(validation_data$observation_path)[54],]
+atl_plot_tag(dunlin)
 ```
 
 ```{r}
-track_m3 <- atl_median_smooth(data = track, time = "TIME", X = "X_raw", Y = "Y_raw", moving_window = 3)
-track_m3 <- get_properties(track_m3)
+# select and rename relevant columns
+rawData <- dunlin
+#rawData[which(rawData$step_length == 0), c("X", "Y", "speed_in")] <- NA
+rawData[which(rawData$dtime > 64), c("X", "Y", "speed_out")] <- NA
+rawData <- rawData[,c("tag","time","X","Y", "speed_out")]
+colnames(rawData) <- c("ID","time","x","y", "speed_out")
+hmmData = prepData(data=rawData)
 ```
 
 ```{r}
-track_sf <- st_as_sf(track, coords=c("X_raw", "Y_raw"), crs=st_crs(32631))
-track_sf_m3 <-st_as_sf(track_m3, coords=c("X", "Y"), crs=st_crs(32631))
+nbStates=3
+
+stateNames <- c(
+  "inactive", 
+  "active",
+  "flying"
+)
+
+dist = list(
+  step = "gamma", 
+  angle = "wrpcauchy",
+  speed_out = "gamma"
+)
+
+stepPar0<-c(
+  1.5, 6, 140,
+  1, 3, 224,
+  0.17, 6.100306e-08, 9.116700e-08
+)
+anglePar0 = c(
+  0.3, 0.6, 0.8
+)
+speedPar0 <- c(
+  0.05, 1.776849e-01, 2.408613,
+  0.03, 1.833827e-02, 3.110865,
+  0.1866896, 6.947236e-08, 9.116700e-08
+)
+```
+
+
+```{r}
+# Set step design matrix such that
+# mu3 > mu2 > mu1
+stepDM <- matrix(
+  c(1,0,0,0,0,0,0,0,0,
+    1,1,0,0,0,0,0,0,0,
+    1,1,1,0,0,0,0,0,0,
+    0,0,0,1,0,0,0,0,0,
+    0,0,0,0,1,0,0,0,0,
+    0,0,0,0,0,1,0,0,0,
+    0,0,0,0,0,0,1,0,0,
+    0,0,0,0,0,0,0,1,0,
+    0,0,0,0,0,0,0,0,1),
+  nrow = 3*nbStates,
+  byrow = T,
+  dimnames = list(c(paste0("mu_", 1:nbStates),
+                    paste0("sd_", 1:nbStates),
+                    paste0("zeromass_", 1:nbStates)),
+                  c("wmu_1","wmu_2","wmu_3",
+                    paste0("wsd_", 1:nbStates),
+                    paste0("wzeromass_", 1:nbStates))))
+stepworkBounds <- matrix(
+  c(-Inf,Inf,
+    0,Inf,
+    0,Inf,
+    -Inf,Inf,
+    -Inf,Inf,
+    -Inf,Inf,
+    -Inf,Inf,
+    -Inf,Inf,
+    -Inf,Inf),
+  nrow=ncol(stepDM),
+  byrow = TRUE,
+  dimnames=list(c("wmu_1","wmu_2","wmu_3",
+                  paste0("wsd_", 1:nbStates),
+                  paste0("wzeromass_", 1:nbStates)),
+                c("lower","upper")))
+
+Par0<-getParDM(
+  data = hmmData,
+  nbStates = nbStates,
+  zeroInflation = list(step = T, speed_out = T),
+  dist = list(step = 'gamma', speed_out = 'gamma'),
+  Par = list(step = stepPar0, speed_out = speedPar0),
+  DM = list(step = stepDM, speed_out = stepDM),
+  workBounds = list(step = stepworkBounds, speed_out = stepworkBounds)
+)
+
+# Force flight zero mass to be next to none, we really don't
+# expect any of the flight localisations to have a step length
+# of 0 or a speed of 0
+fixPar = list(
+  step = c(NA, NA, NA,
+           NA, NA, NA,
+           NA, NA, stats::qlogis(1.e-100)),
+  speed_out = c(NA, NA, NA,
+               NA, NA, NA,
+               NA, NA, stats::qlogis(1.e-100))
+)
 ```
 
 ```{r}
-plot_path <- ggplot() +
-  layer_spatial(track_sf, aes(col = pure_behaviour), size=1, alpha=0.5)
-plot_path_m3 <- ggplot() +
-  layer_spatial(track_sf_m3, aes(col = pure_behaviour), size=1, alpha=0.5)
-grid.arrange(plot_path, plot_path_m3, nrow=2)
+hmmData[which.max(hmmData$step),] 
 ```
+
+```{r}
+m1 <- fitCTHMM(
+  data = hmmData, 
+  type = 'UTM',
+  stateNames = stateNames,
+  nbStates = nbStates, 
+  dist = dist, 
+  Par0 = list(
+    step=Par0$step, 
+    angle=anglePar0,
+    speed_out=Par0$speed_out
+  ),
+  DM=list(
+    step=stepDM,
+    speed_out=stepDM
+  ),
+  workBounds = list(
+    step=stepworkBounds,
+    speed_out=stepworkBounds
+  ),
+  fixPar=fixPar,
+  nlmPar=list(print.level=2)
+)
+
+# decode most likely state sequence
+states <- viterbi(m1)
+# derive percentage of time spent in each state
+table(states)/nrow(hmmData)
+# plot results for model m2
+plot(m1)
+```
+
+```{r}
+# compute pseudo-residuals for the steps and the angles
+pr <- pseudoRes(m1)
+# plot the ACF of step pseudo-residuals
+acf(pr$stepRes[!is.na(pr$stepRes)],lag.max = 300)
+```
+
+# Comparison to Validation Data
+```{r}
+track <- read.csv('resources/validation_data_thinned.csv', sep=';')
+track$time <- as.POSIXct(track$time, tz="Europe/Amsterdam")
+track <- get_properties(track, x='X', y='Y')
+```
+
 # Pure behaviour characteristics 
 ```{r}
-pure_active <- track_m3[track_m3$pure_behaviour == 'active',]
-pure_inactive <- track_m3[track_m3$pure_behaviour == 'inactive',]
+pure_active <- na.omit(track[track$pure_behaviour == 'active',])
+pure_active$step_length <- pure_active$step_length 
+pure_inactive <- na.omit(track[track$pure_behaviour == 'inactive',])
+pure_inactive$step_length <- pure_inactive$step_length
 pure_mixed <- track[track$pure_behaviour == 'mixed',]
 
 fit.pure_active <- fitdist(pure_active$step_length, distr = "gamma", method = "mle")
@@ -84,7 +239,6 @@ get_step_length_dist <- function(track) {
 
 ```{r}
 fit_track <- get_step_length_dist(track)
-fit_track_m3 <- get_step_length_dist(track_m3)
 
 get_step_length_plot <- function(track, fit_track) {
   return(
@@ -113,79 +267,37 @@ get_step_length_plot <- function(track, fit_track) {
 }
 
 track_plot <- get_step_length_plot(track, fit_track)
-track_m3_plot <- get_step_length_plot(track_m3, fit_track_m3)
-grid.arrange(track_plot, track_m3_plot, nrow=2)
+plot(track_plot)
 ```
 
 ```{r}
+dunlin$pred_state <- states
+track_interval <- interval(min(track$time), max(track$time))
+track_sf <- st_as_sf(track, coords=c('X','Y'), crs=32631)
+dunlin_track <- dunlin[dunlin$time %within% track_interval,]
+dunlin_track <- st_as_sf(dunlin_track, coords=c('X','Y'), crs=32631)
 
+plot1 <- ggplot() +
+  annotation_spatial(land_sf, col="black", fill="grey49") +
+  annotation_spatial(mudflats_sf, col="grey49", fill="grey90") +
+  layer_spatial(dunlin_track, aes(col=as.factor(pred_state)), alpha=0.5) 
+
+plot2 <- ggplot() +
+  annotation_spatial(land_sf, col="black", fill="grey49") +
+  annotation_spatial(mudflats_sf, col="grey49", fill="grey90") +
+  layer_spatial(track_sf, aes(col=as.factor(pure_behaviour)), alpha=0.5) 
+
+grid.arrange(plot1, plot2)
 ```
 
 ```{r}
-# select and rename relevant columns
-rawData <- track[,c("tag","time","X","Y", "speed_in")]
-colnames(rawData) <- c("ID","time","x","y", "speed_in")
+nrow(dunlin_track[dunlin_track$pred_state == 1,]) / nrow(track)
+nrow(dunlin_track[dunlin_track$pred_state == 2,]) / nrow(track)
+```
 
-crwOut<-crawlWrap(
-  rawData,
-  timeStep="8 secs",
-  #theta=c(6.855, -0.007),
-  fixPar=c(NA,NA)
-)
-plot(crwOut,ask=FALSE)
-hmmData <- prepData(data=crwOut)
-
-stateNames <- c("active","inactive")
-# distributions for observation processes
-dist = list(
-  step = "gamma", 
-  angle = "wrpcauchy",
-  speed_in = "gamma"
-)
-# initial parameters
-Par0_m1 <- list(
-  step=c(
-    8.26, 2.52,  # mean
-    1.73, 1.96,  # standard deviation
-    0.0001, 0.0001
-  ),
-  angle=c(
-    0.5,
-    0.1
-  ),
-  speed_in=c(
-    0.05, 0.2,
-    0.1, 0.4
-  )
-)
-
-# fit model
-m1 <- fitHMM(
-  data = hmmData, 
-  nbStates = 2, 
-  dist = dist, 
-  Par0 = Par0_m1, 
-  stateNames = stateNames
-)
-
-# decode most likely state sequence
-states <- viterbi(m1)
-# derive percentage of time spent in each state
-table(states)/nrow(hmmData)
-
-# plot results for model m3
-plot(m1)
-
-# plot satellite image for model m3
-plotSat(
-  m1,
-  zoom=8,
-  col=c("firebrick3","seagreen4"),
-  projargs = proj4string(utmcoord),ask=FALSE
-)
-# compute pseudo-residuals for the steps and the angles
-pr <- pseudoRes(m1)
-# plot the ACF of step pseudo-residuals
-acf(pr$stepRes[!is.na(pr$stepRes)],lag.max = 300)
+```{r}
+nrow(track[track$pure_behaviour == 'inactive',]) / nrow(track)
+nrow(track[track$pure_behaviour == 'active',]) / nrow(track)
+nrow(track[track$pure_behaviour == 'mixed',]) / nrow(track)
 ```
 

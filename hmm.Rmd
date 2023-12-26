@@ -1,0 +1,67 @@
+---
+title: "hmm"
+author: "Niels van der Vegt"
+date: "2023-11-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(momentuHMM)
+```
+
+```{r}
+data <- read.csv('./resources/validation_data.csv', sep=';')
+# select and rename relevant columns
+rawData <- data[,c(3,5,12,13)]
+colnames(rawData) <- c("ID","time","x","y")
+
+rawData <- rawData[rawData$ID == unique(rawData$ID)[1],]
+rawData <- rawData[1:36,]
+rawData$time <- as.POSIXct(rawData$time,tz="Europe/Amsterdam")
+
+crwOut<-crawlWrap(
+  rawData,
+  timeStep="8 secs",
+  #theta=c(6.855, -0.007),
+  fixPar=c(NA,NA)
+)
+plot(crwOut,ask=FALSE)
+
+hmmData <- prepData(data=crwOut)
+# acf plot of step lengths
+acf(hmmData$step[!is.na(hmmData$step)],lag.max=300)
+
+# label states
+stateNames <- c("active","inactive")
+# distributions for observation processes
+dist = list(step = "gamma", angle = "wrpcauchy")
+
+# initial parameters
+Par0_m1 <- list(step=c(100,200,100,100),angle=c(0.5,0.1))
+
+# fit model
+m1 <- fitHMM(data = hmmData, nbStates = 2, dist = dist, Par0 = Par0_m1, 
+             estAngleMean = list(angle=FALSE), stateNames = stateNames)
+
+# decode most likely state sequence
+states <- viterbi(m1)
+# derive percentage of time spent in each state
+table(states)/nrow(hmmData)
+
+# plot results for model m3
+plot(m1, plotCI = TRUE)
+
+# plot satellite image for model m3
+plotSat(m3,zoom=8,col=c("firebrick3","seagreen4"),projargs = proj4string(utmcoord),ask=FALSE)
+
+# compute pseudo-residuals for the steps and the angles
+pr <- pseudoRes(m3)
+
+# plot the ACF of step pseudo-residuals
+acf(pr$stepRes[!is.na(pr$stepRes)],lag.max = 300)
+```
+

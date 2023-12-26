@@ -141,8 +141,8 @@ get_properties <- function(
   watlas$dtime <- sapply(
     1:nrow(watlas),
     FUN = function(i) {
-      if (i == 1) return(0)  # TODO this should be NA
-      return(watlas[i, "time"] - watlas[i - 1, "time"])
+      if (i == 1) return(NA)
+      return(seconds(watlas[i, "time"] - watlas[i - 1, "time"]))
     }
   )
   # step length
@@ -259,7 +259,13 @@ get_watlas_for_observation <- function(
   watlas_interval <- interval(watlas[1, "time"], watlas[nrow(watlas), "time"])
   
   # create properties
-  watlas <- get_properties(watlas, x='X_raw', y='Y_raw')
+  # TODO raw? now its median smoothed by 3
+  watlas <- atl_thin_data(
+    watlas,
+    interval=40,
+    method="aggregate"
+  )
+  watlas <- get_properties(watlas, x='X', y='Y')
   
   # find the overlap between the observation and the watlas data
   # then only keep the watlas localisations that were within the timeframe
@@ -280,6 +286,7 @@ get_watlas_for_observation <- function(
 files <- list.files('resources/observations', full.names=T)
 observations <- list()
 validation_data <- data.frame()
+files <- files[68]
 
 for (file in files) {
   print(file)
@@ -310,7 +317,7 @@ validation_data <- validation_data[validation_data$behaviour != "camera malfunct
 ```
 
 ```{r}
-write.table(validation_data, 'resources/validation_data.csv', sep=';')
+write.table(validation_data, 'resources/validation_data_thinned.csv', sep=';')
 ```
 
 

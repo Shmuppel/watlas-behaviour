@@ -1,0 +1,27 @@
+---
+title: "add_validation_metadata"
+author: "Niels van der Vegt"
+date: "2023-12-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(exifr)
+```
+
+```{r}
+ex <- read_exif('resources/new_observations/20230913_3208.MOV')
+```
+
+```{r}
+ex$CreationDate
+ex$GPSLatitude
+ex$GPSLongitude
+```
+```
+
+
