@@ -45,7 +45,7 @@ preprocess_watlas <- function(watlas) {
 }
 dunlin <- read.csv('resources/watlas/dunlin-all/dunlin-3208.csv')
 dunlin <- preprocess_watlas(dunlin)
-day_interval <- interval(ymd_hms("2023-09-13 00:00:00"), ymd_hms("2023-09-13 23:59:59"))
+day_interval <- interval(ymd_hms("2023-09-01 00:00:00"), ymd_hms("2023-09-14 23:59:59"))
 dunlin <- dunlin[dunlin$time %within% day_interval,]
 ```
 
@@ -60,7 +60,10 @@ rawData <- dunlin
 rawData[which(rawData$dtime > 64), c("X", "Y", "speed_out")] <- NA
 rawData <- rawData[,c("tag","time","X","Y", "speed_out")]
 colnames(rawData) <- c("ID","time","x","y", "speed_out")
-hmmData = prepData(data=rawData)
+hmmData = prepData(
+  data=rawData,
+  type='UTM'
+)
 ```
 
 ```{r}
@@ -184,8 +187,10 @@ m1 <- fitCTHMM(
 )
 
 # decode most likely state sequence
+states1 <- viterbi(best_mod)
 states <- viterbi(m1)
 # derive percentage of time spent in each state
+table(states1)/nrow(hmmData)
 table(states)/nrow(hmmData)
 # plot results for model m2
 plot(m1)

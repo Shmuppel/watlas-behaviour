@@ -20,13 +20,15 @@ get_properties <- function(
       X = x,
       Y = y
     )
+  
   # turning angle
-  watlas$angle <- 
-    atl_turning_angle(
-      data = watlas,
-      time = "TIME",
-      X = x,
-      Y = y)
+  watlas$angle <- atl_turning_angle(
+    data = watlas,
+    time = "TIME",
+    X = x,
+    Y = y
+  )
+  
   # create delta time feature, which is the time difference in seconds
   # basically, how many seconds passed since the last localisation
   watlas$dtime <- sapply(

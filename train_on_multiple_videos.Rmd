@@ -1,0 +1,327 @@
+---
+title: "train_on_multiple_videos"
+author: "Niels van der Vegt"
+date: "2023-12-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# SETTINGS
+AGGREGATION_INTERVAL = 24  # seconds 
+```
+
+```{r, echo=F, message=F, results='hide'}
+library(tools4watlas)
+library(ggplot2)
+library(ggspatial)
+library(sf)
+library(sfheaders)
+library(sp)
+library(rgdal)
+library(lubridate)
+source('util.R')
+devtools::install_local("../momentuHMM_2.0.0.tar.gz") 
+```
+
+```{r}
+set.seed(12345)
+```
+
+```{r}
+validation_data <- read.csv(
+  glue('resources/validation_data_{AGGREGATION_INTERVAL}s.csv',
+       AGGREGATION_INTERVAL=AGGREGATION_INTERVAL),
+  sep=';'
+)
+```
+
+# For each observed date, I will grab the whole day of WATLAS data
+```{r}
+training_data <- data.frame()
+# c(unique(validation_data$tag)[3], unique(validation_data$tag)[4])
+for (dunlin in unique(validation_data$tag)) {
+  watlas <- read.csv(glue('resources/watlas/dunlin-all/dunlin-{tag}.csv',
+                          tag=dunlin))
+  # convert watlas time to timezone from observation
+  watlas$time <- ymd_hms(watlas$time, tz = "UTC")
+  watlas$time <- with_tz(watlas$time, tzone = "Europe/Amsterdam")
+  # apply same aggregation as validation data
+  watlas <- atl_thin_data(
+    watlas,
+    interval=AGGREGATION_INTERVAL,
+    method="aggregate"
+  )
+  # get properties
+  watlas <- get_properties(watlas, x='X', y='Y')
+  
+  # get unique dates of validation data
+  dunlin_validation_data <- validation_data[validation_data$tag == dunlin,]
+  unique_dates <- unique(date(dunlin_validation_data$time))
+  # add those dates to the training data
+  for (unique_date in unique_dates) {
+    day_interval <- interval(
+      ymd_hms(paste(as.Date(unique_date), " 00:00:01"), tz="Europe/Amsterdam"), 
+      ymd_hms(paste(as.Date(unique_date), " 23:59:59"), tz="Europe/Amsterdam"),
+    )
+    training_data <- bind_rows(
+      training_data,
+      watlas[watlas$time %within% day_interval,]
+    )
+  }
+}
+```
+```{r}
+# select and rename relevant columns
+#rawData[which(rawData$step_length == 0), c("X", "Y", "speed_in")] <- NA
+
+training_data[which(training_data$dtime > AGGREGATION_INTERVAL * 2),
+              c( "speed_in", "step_length", "angle")] <- NA
+training_data$angle <- training_data$angle * pi / 180  # convert angle to radians
+
+hmmData <- training_data[,c("tag", "time", "X", "Y", "speed_in")]
+colnames(hmmData) <- c("ID", "time", "x","y", "speed_in")
+
+hmmData <- prepData(
+  data=hmmData,
+  type="UTM"
+)
+
+hmmData$step <- training_data$step_length
+hmmData$angle <- training_data$angle
+```
+
+# HMM parameters 
+```{r}
+nbStates=3
+
+stateNames <- c(
+  "inactive", 
+  "active",
+  "flying"
+)
+
+# distributions for all data strems
+dist = list(
+  step = "gamma", 
+  angle = "wrpcauchy",
+  speed_in = "gamma"
+)
+
+# priors / initial distribution settings 
+stepPar0<-c(
+  1.5, 6, 140,  #  mean inactive, mean active, mean flying
+  1, 3, 224,  #  sd inactive, sd active...
+  0.17, 6.100306e-08, 9.116700e-08  #  zero mass inactive, zero mass active...
+)
+anglePar0 = c(
+  0.3, 0.6, 0.8  #  concentration inactive, concentration active...
+)
+speedPar0 <- c(
+  0.05, 1.776849e-01, 2.408613,
+  0.03, 1.833827e-02, 3.110865,
+  0.1866896, 6.947236e-08, 9.116700e-08
+)
+```
+
+```{r}
+# Set step design matrix such that
+# mu3 > mu2 > mu1
+stepDM <- matrix(
+  c(1,0,0,0,0,0,0,0,0,
+    1,1,0,0,0,0,0,0,0,
+    1,1,1,0,0,0,0,0,0,
+    0,0,0,1,0,0,0,0,0,
+    0,0,0,0,1,0,0,0,0,
+    0,0,0,0,0,1,0,0,0,
+    0,0,0,0,0,0,1,0,0,
+    0,0,0,0,0,0,0,1,0,
+    0,0,0,0,0,0,0,0,1),
+  nrow = 3*nbStates,
+  byrow = T,
+  dimnames = list(c(paste0("mu_", 1:nbStates),
+                    paste0("sd_", 1:nbStates),
+                    paste0("zeromass_", 1:nbStates)),
+                  c("wmu_1","wmu_2","wmu_3",
+                    paste0("wsd_", 1:nbStates),
+                    paste0("wzeromass_", 1:nbStates))))
+stepworkBounds <- matrix(
+  c(-Inf,Inf,
+    0,Inf,
+    0,Inf,
+    -Inf,Inf,
+    -Inf,Inf,
+    -Inf,Inf,
+    -Inf,Inf,
+    -Inf,Inf,
+    -Inf,Inf),
+  nrow=ncol(stepDM),
+  byrow = TRUE,
+  dimnames=list(c("wmu_1","wmu_2","wmu_3",
+                  paste0("wsd_", 1:nbStates),
+                  paste0("wzeromass_", 1:nbStates)),
+                c("lower","upper")))
+
+Par0<-getParDM(
+  data = hmmData,
+  nbStates = nbStates,
+  zeroInflation = list(step = T, speed_in = T),
+  dist = list(step = 'gamma', speed_in = 'gamma'),
+  Par = list(step = stepPar0, speed_in = speedPar0),
+  DM = list(step = stepDM, speed_in = stepDM),
+  workBounds = list(step = stepworkBounds, speed_in = stepworkBounds)
+)
+
+# Force flight zero mass to be next to none, we really don't
+# expect any of the flight localisations to have a step length
+# of 0 or a speed of 0
+fixPar = list(
+  step = c(NA, NA, NA,
+           NA, NA, NA,
+           NA, NA, stats::qlogis(1.e-100)),
+  speed_in = c(NA, NA, NA,
+               NA, NA, NA,
+               NA, NA, stats::qlogis(1.e-100))
+)
+```
+
+
+```{r, echo=F, message=F, results='hide'}
+m1 <- fitCTHMM(
+  data = hmmData, 
+  type = 'UTM',
+  stateNames = stateNames,
+  nbStates = nbStates, 
+  dist = dist, 
+  Par0 = list(
+    step=Par0$step, 
+    angle=anglePar0,
+    speed_in=Par0$speed_in
+  ),
+  DM=list(
+    step=stepDM,
+    speed_in=stepDM
+  ),
+  workBounds = list(
+    step=stepworkBounds,
+    speed_in=stepworkBounds
+  ),
+  fixPar=fixPar,
+  #nlmPar=list(print.level=2),
+  formula=~ID+0,
+  formulaDelta=~ID+0
+)
+```
+```{r}
+# decode most likely state sequence
+states <- viterbi(m1)
+# derive percentage of time spent in each state
+table(states)/nrow(hmmData)
+# plot results for model m2
+plot(m1)
+```
+
+# plot with fragmented sections (after 2x aggregation interval new section)
+```{r}
+training_data$pred_state <- states
+
+get_linestrings <- function(localisations) {
+  segment <- matrix(as.numeric(localisations[1, c("X", "Y")]), nrow=1, ncol=2)
+  behaviours <- c()
+  linestrings <- list()
+  
+  add_segment <- function(i) {
+    if (nrow(segment) > 1) {
+      linestring <- st_linestring(x = segment, dim = "XY")
+      linestrings[[length(linestrings) + 1]] <<- linestring
+      behaviours <<- c(behaviours, localisations[i - 1, "pred_state"]) 
+    } 
+  }
+  
+  for(i in 1:nrow(localisations)) {
+    if (i == 1) next  # already added during initialisation
+    # if 
+    if (
+      localisations[i, "tag"] != localisations[i - 1, "tag"] ||
+      localisations[i, "dtime"] > AGGREGATION_INTERVAL * 2
+    ) {
+      add_segment(i)
+      segment <- matrix(
+        as.numeric(localisations[i, c("X", "Y")]), 
+        nrow=1, ncol=2
+      )  # create new linestring
+      next
+    }
+    # else, we're going to add to an existing linestring
+    if (localisations[i, "pred_state"] != localisations[i - 1, "pred_state"]) {
+      add_segment(i)
+      # as this is an extension of the previous linestring we add the previous point
+      segment <- matrix(
+        as.numeric(
+          c(localisations[i - 1, c("X", "Y")], 
+            localisations[i, c("X", "Y")])
+        ),
+        nrow=2, ncol=2, byrow=T
+      )
+      next
+    }
+    # same behaviour
+    segment <- rbind(segment, matrix(as.numeric(localisations[i, c("X", "Y")]), nrow=1, ncol=2))
+    # add last segment if not already added
+    if (i == nrow(localisations)) add_segment(i)
+  }
+  
+  linestrings <- st_sfc(linestrings, crs=32631)
+  linestrings <- st_as_sf(linestrings)
+  linestrings$pred_state <- behaviours
+  return(linestrings)
+}
+```
+
+
+```{r}
+plot_data <- training_data[training_data$tag == 3208,]
+feat_linestrings <- get_linestrings(plot_data)
+feat_points <- st_as_sf(plot_data, coords=c('X','Y'), crs=st_crs(32631))
+ggplot() +
+  layer_spatial(feat_points, aes(col=as.factor(pred_state), alpha=0.5)) +
+  layer_spatial(feat_linestrings, aes(col=as.factor(pred_state), alpha=.5))
+```
+
+# plot with behaviour in relation to griend
+```{r}
+
+```
+
+
+```{r}
+  localisations$linestring_id <- sapply(
+    1:nrow(localisations), 
+    FUN = function(i) {
+      if (i == 1) return(linestring_id)
+      if (
+        localisations[i, "tag"] != localisations[i - 1, "tag"] ||
+        localisations[i, "dtime"] > AGGREGATION_INTERVAL * 2
+      ) linestring_id <<- linestring_id + 1
+      return(linestring_id)
+  })
+  segment_linestring <- sf_linestring(
+    localisations,
+    x = 'X',
+    y = 'Y',
+    linestring_id = 'linestring_id'
+  )
+  segment_linestring$multiple_points <- sapply(
+    segment_linestring[[2]], 
+    FUN=function(linestring) length(linestring) > 2
+  )
+  segment_linestring <- segment_linestring[segment_linestring$multiple_points == T,]
+  segment_linestring <- st_set_crs(segment_linestring, 32631)
+  return(segment_linestring)
+```
+
+
+

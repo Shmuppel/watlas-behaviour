@@ -9,6 +9,11 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+```{r}
+# SETTINGS
+AGGREGATION_INTERVAL = 24  # seconds 
+```
+
 ```{r message=FALSE}
 library(lubridate)
 library(testit)
@@ -18,6 +23,7 @@ library(ggplot2)
 library(tools4watlas)
 library(glue)
 library(dplyr)
+source('util.R')
 ```
 
 ```{r}
@@ -74,15 +80,15 @@ preprocess_observation <- function(observation_path) {
     return(as.character(behaviour_dict[behavior]))
   })
   
-  # if the last observation was a camera malfunction, just clip the behaviour 
-  # early, this is often assigned after the bird flies away and is out of sight
+  # if the last observation was a camera malfunction, remove the last observation
+  # this is often assigned after the bird flies away and is out of sight
   last_observation <- tail(observation_data, 1)
   if (last_observation$Behavior == 'camera malfunction') {
     observation_data <- head(observation_data, -1)
   }
   
   # if the last observation was flying, assume the bird flies a little longer,
-  # even though this is technically not observed.
+  # even though this is technically not observed
   last_observation <- tail(observation_data, 1)
   if (last_observation$Behavior == 'flying') {
     # TODO we could cut the based on speed later
@@ -107,51 +113,6 @@ preprocess_observation <- function(observation_path) {
 ```
 
 ```{r}
-get_properties <- function(
-    watlas,
-    x='X_raw',
-    y='Y_raw'
-  ) {
-  # speed
-  watlas$speed_in <-
-    atl_get_speed(
-      data = watlas,
-      time = "TIME",
-      type = "in",
-      X = x,
-      Y = y
-    )
-  watlas$speed_out <-
-    atl_get_speed(
-      data = watlas,
-      time = "TIME",
-      type = "out",
-      X = x,
-      Y = y
-    )
-  # turning angle
-  watlas$angle <- 
-    atl_turning_angle(
-      data = watlas,
-      time = "TIME",
-      X = x,
-      Y = y)
-  # create delta time feature, which is the time difference in seconds
-  # basically, how many seconds passed since the last localisation
-  watlas$dtime <- sapply(
-    1:nrow(watlas),
-    FUN = function(i) {
-      if (i == 1) return(NA)
-      return(seconds(watlas[i, "time"] - watlas[i - 1, "time"]))
-    }
-  )
-  # step length
-  watlas_sf <- st_as_sf(watlas, coords=c(x, y), crs=st_crs(32631))
-  distance <- st_distance(head(watlas_sf, -1), tail(watlas_sf, -1), by_element=T)
-  watlas$step_length <- c(NA, distance)
-  return(watlas)
-}
-
 get_behaviour <- function(watlas, observation) {
     watlas[,c("active", "inactive", "flying", "behaviour", "pure_behaviour")] <- t(sapply(
     1:nrow(watlas),
@@ -211,7 +172,6 @@ get_behaviour <- function(watlas, observation) {
       
       # if flying was observed, this observation should be flying
       # this is because the large changes in speed and location during this behavior
-      # TODO feedback on this
       if (x_behaviours[["flying"]] > 0) {
         behaviour <- "flying"
       } else {
@@ -247,8 +207,7 @@ get_behaviour <- function(watlas, observation) {
 
 
 get_watlas_for_observation <- function(
-    observation,
-    aggregate=F
+    observation
   ) {
   watlas <- read.csv(glue(
     'resources/watlas/dunlin-all/dunlin-{tag}.csv',
@@ -259,10 +218,9 @@ get_watlas_for_observation <- function(
   watlas_interval <- interval(watlas[1, "time"], watlas[nrow(watlas), "time"])
   
   # create properties
-  # TODO raw? now its median smoothed by 3
   watlas <- atl_thin_data(
     watlas,
-    interval=40,
+    interval=AGGREGATION_INTERVAL,
     method="aggregate"
   )
   watlas <- get_properties(watlas, x='X', y='Y')
@@ -286,7 +244,6 @@ get_watlas_for_observation <- function(
 files <- list.files('resources/observations', full.names=T)
 observations <- list()
 validation_data <- data.frame()
-files <- files[68]
 
 for (file in files) {
   print(file)
@@ -317,7 +274,12 @@ validation_data <- validation_data[validation_data$behaviour != "camera malfunct
 ```
 
 ```{r}
-write.table(validation_data, 'resources/validation_data_thinned.csv', sep=';')
+write.table(
+  validation_data, 
+  glue('resources/validation_data_{AGGREGATION_INTERVAL}s.csv',
+       AGGREGATION_INTERVAL=AGGREGATION_INTERVAL),
+  sep=';'
+)
 ```
 
 
