@@ -114,23 +114,21 @@ preprocess_observation <- function(observation_path) {
 
 ```{r}
 get_behaviour <- function(watlas, observation) {
+    get_next_closest_observation <- function(i) {
+      x <- watlas[i, "time"] - observation$data$Time
+      closest <- min(abs(x[x <= 0]))
+      closest_observation <- observation$data[which(x == -closest), ][1,]
+      return(closest_observation)
+    }
     watlas[,c("active", "inactive", "flying", "behaviour", "pure_behaviour")] <- t(sapply(
     1:nrow(watlas),
     FUN = function(i) {
-      # TODO don't like initialising a function 1000s of times, clean up
-      get_next_closest_observation <- function() {
-        x <- watlas[i, "time"] - observation$data$Time
-        closest <- min(abs(x[x <= 0]))
-        closest_observation <- observation$data[which(x == -closest), ][1,]
-        return(closest_observation)
-      }
-      
       # start is the the time of the previous watlas localisation
       x_start <- watlas[i, "time"] - watlas[i, "dtime"]
       # end is this localisation
       x_end <- watlas[i, "time"] 
       x_interval <- interval(x_start, x_end)
-      x_next_observation <- get_next_closest_observation()
+      x_next_observation <- get_next_closest_observation(i)
       
       # x entries should be:
       # any observations between the last localisation, and the current localisation

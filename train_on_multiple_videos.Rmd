@@ -19,10 +19,16 @@ library(tools4watlas)
 library(ggplot2)
 library(ggspatial)
 library(sf)
+library(grid)
+library(gridExtra)
 library(sfheaders)
 library(sp)
 library(rgdal)
+library(dplyr)
+library(glue)
 library(lubridate)
+library(raster)
+library(stringr) 
 source('util.R')
 devtools::install_local("../momentuHMM_2.0.0.tar.gz") 
 ```
@@ -37,13 +43,13 @@ validation_data <- read.csv(
        AGGREGATION_INTERVAL=AGGREGATION_INTERVAL),
   sep=';'
 )
+validation_data$time <- as.POSIXct(validation_data$time, tz="Europe/Amsterdam")
 ```
 
 # For each observed date, I will grab the whole day of WATLAS data
 ```{r}
 training_data <- data.frame()
-# c(unique(validation_data$tag)[3], unique(validation_data$tag)[4])
-for (dunlin in unique(validation_data$tag)) {
+for (dunlin in unique(validation_data$tag)[1:3]) {
   watlas <- read.csv(glue('resources/watlas/dunlin-all/dunlin-{tag}.csv',
                           tag=dunlin))
   # convert watlas time to timezone from observation
@@ -74,22 +80,25 @@ for (dunlin in unique(validation_data$tag)) {
   }
 }
 ```
+
 ```{r}
 # select and rename relevant columns
 #rawData[which(rawData$step_length == 0), c("X", "Y", "speed_in")] <- NA
-
 training_data[which(training_data$dtime > AGGREGATION_INTERVAL * 2),
               c( "speed_in", "step_length", "angle")] <- NA
 training_data$angle <- training_data$angle * pi / 180  # convert angle to radians
+```
 
+```{r}
 hmmData <- training_data[,c("tag", "time", "X", "Y", "speed_in")]
 colnames(hmmData) <- c("ID", "time", "x","y", "speed_in")
 
-hmmData <- prepData(
+hmmData <- momentuHMM::prepData(
   data=hmmData,
   type="UTM"
 )
 
+# overwrite the step and angle with our own data
 hmmData$step <- training_data$step_length
 hmmData$angle <- training_data$angle
 ```
@@ -165,7 +174,7 @@ stepworkBounds <- matrix(
                   paste0("wzeromass_", 1:nbStates)),
                 c("lower","upper")))
 
-Par0<-getParDM(
+Par0<- momentuHMM::getParDM(
   data = hmmData,
   nbStates = nbStates,
   zeroInflation = list(step = T, speed_in = T),
@@ -190,9 +199,8 @@ fixPar = list(
 
 
 ```{r, echo=F, message=F, results='hide'}
-m1 <- fitCTHMM(
+m1 <- momentuHMM::fitCTHMM(
   data = hmmData, 
-  type = 'UTM',
   stateNames = stateNames,
   nbStates = nbStates, 
   dist = dist, 
@@ -215,29 +223,41 @@ m1 <- fitCTHMM(
   formulaDelta=~ID+0
 )
 ```
+
 ```{r}
 # decode most likely state sequence
-states <- viterbi(m1)
+states <- momentuHMM::viterbi(m1)
 # derive percentage of time spent in each state
 table(states)/nrow(hmmData)
 # plot results for model m2
 plot(m1)
 ```
 
-# plot with fragmented sections (after 2x aggregation interval new section)
 ```{r}
 training_data$pred_state <- states
+training_data[training_data$pred_state == 1,]$pred_state <- 'inactive'
+training_data[training_data$pred_state == 2,]$pred_state <- 'active'
+training_data[training_data$pred_state == 3,]$pred_state <- 'flying'
+training_data$pred_state <- as.factor(training_data$pred_state)
+```
 
+
+# plot with fragmented sections (after 2x aggregation interval new section)
+```{r}
 get_linestrings <- function(localisations) {
+  # start the segment with the first localisation
   segment <- matrix(as.numeric(localisations[1, c("X", "Y")]), nrow=1, ncol=2)
-  behaviours <- c()
-  linestrings <- list()
+  behaviours <- c()  # one behaviour for each linestring
+  linestrings <- list()  # collection of linestrings
   
+  # add new linestring to collection of linestrings, and save the behaviour
+  # this linestring should have
   add_segment <- function(i) {
+    # if there is just 1 localisation we can't create a line, so skip it
     if (nrow(segment) > 1) {
       linestring <- st_linestring(x = segment, dim = "XY")
       linestrings[[length(linestrings) + 1]] <<- linestring
-      behaviours <<- c(behaviours, localisations[i - 1, "pred_state"]) 
+      behaviours <<- c(behaviours, as.character(localisations[i - 1, "pred_state"])) 
     } 
   }
   
@@ -268,7 +288,7 @@ get_linestrings <- function(localisations) {
       )
       next
     }
-    # same behaviour
+    # same behaviour, just extend the linestring
     segment <- rbind(segment, matrix(as.numeric(localisations[i, c("X", "Y")]), nrow=1, ncol=2))
     # add last segment if not already added
     if (i == nrow(localisations)) add_segment(i)
@@ -281,47 +301,216 @@ get_linestrings <- function(localisations) {
 }
 ```
 
-
 ```{r}
-plot_data <- training_data[training_data$tag == 3208,]
+plot_data <- training_data[training_data$tag == 2960,]
 feat_linestrings <- get_linestrings(plot_data)
 feat_points <- st_as_sf(plot_data, coords=c('X','Y'), crs=st_crs(32631))
+
+# WGS 4326 in order to use satallite / map tiles
+feat_linestrings <- st_transform(feat_linestrings, crs=4326)
+feat_points <- st_transform(feat_points, crs=4326)
+
+# TODO mapbox logo
 ggplot() +
-  layer_spatial(feat_points, aes(col=as.factor(pred_state), alpha=0.5)) +
-  layer_spatial(feat_linestrings, aes(col=as.factor(pred_state), alpha=.5))
+  annotation_map_tile("cartodark", zoom=12) +
+  layer_spatial(feat_points, aes(col=as.factor(pred_state)), alpha=.5) +
+  layer_spatial(feat_linestrings, aes(col=as.factor(pred_state)), alpha=.5)
 ```
 
 # plot with behaviour in relation to griend
 ```{r}
+# Libraries
+library(tidyverse)
+library(viridis)
+library(hrbrthemes)
+library(mapdata)
 
+feat_active <- st_transform(st_as_sf(feat_active, coords=c('X', 'Y'), crs=32631), crs=4326)
+
+feat_inactive <- training_data[training_data$pred_state == 1,]
+feat_active <- training_data[training_data$pred_state == 2,]
+feat_flying <- training_data[training_data$pred_state == 3,]
+# xlim / ylim based on bounding box of training data
+# raster, if any values 0 empty
+
+
+# plot
+ggplot(feat_active, aes(x=X, y=Y)) + 
+  geom_bin_2d(bins=30) + 
+  annotation_map_tile("cartodark", zoom=12) 
+) 
 ```
 
+# Validation Plots
+```{r}
+# Get the bbox of the total study area
+feat_validation_data <- st_as_sf(validation_data, coords=c("X", "Y"), crs=st_crs(32631))
+feat_validation_data <- st_transform(feat_validation_data, crs=4326)
+feat_study_area_bbox <- st_as_sfc(st_bbox(feat_validation_data))
+```
 
 ```{r}
-  localisations$linestring_id <- sapply(
-    1:nrow(localisations), 
-    FUN = function(i) {
-      if (i == 1) return(linestring_id)
-      if (
-        localisations[i, "tag"] != localisations[i - 1, "tag"] ||
-        localisations[i, "dtime"] > AGGREGATION_INTERVAL * 2
-      ) linestring_id <<- linestring_id + 1
-      return(linestring_id)
-  })
-  segment_linestring <- sf_linestring(
-    localisations,
-    x = 'X',
-    y = 'Y',
-    linestring_id = 'linestring_id'
+theme_behaviour_plot <- theme(
+  axis.title.x=element_blank(),
+  axis.text.x=element_blank(),
+  axis.ticks.x=element_blank(),
+  axis.title.y=element_blank(),
+  axis.text.y=element_blank(),
+  axis.ticks.y=element_blank()
+)
+
+get_location_plot <- function(
+    training_data
+    ) {
+  feat_training_data <- st_as_sf(training_data, coords=c("X", "Y"), crs=st_crs(32631))
+  feat_training_data <- st_transform(feat_training_data, crs=4326)
+  feat_bbox <- st_as_sfc(st_bbox(feat_training_data))
+  if(nrow(training_data) > 1) {
+    feat_bbox <- st_buffer(feat_bbox, dist=100, endCapStyle='SQUARE', joinStyle='SQUARE')
+  }
+  
+  return(ggplot() +
+           annotation_map_tile(
+             type="osm", 
+             zoom=14,
+             #progress='none'
+            ) +
+           layer_spatial(feat_study_area_bbox, fill=NA) + 
+           layer_spatial(feat_bbox, fill='red', alpha=0.7)
+        )
+}
+  
+get_behaviour_track_plot <- function(
+    name,
+    feat_points,
+    feat_lines = NULL
+  ) {
+  
+  cols <- c(
+    "inactive" = "red", 
+    "active" = "blue", 
+    "flying" = "darkgreen",
+    "mixed" = "grey"
   )
-  segment_linestring$multiple_points <- sapply(
-    segment_linestring[[2]], 
-    FUN=function(linestring) length(linestring) > 2
+  
+  track_plot <- ggplot() +
+    layer_spatial(feat_points, aes(col=plot_color), alpha=0.5) +
+    scale_colour_manual(
+      name = "Predicted State",
+      values = cols,
+      drop=F
+    ) +
+    theme_behaviour_plot
+    
+  
+  if(!is.null(feat_lines) && nrow(feat_lines) > 0) {
+    track_plot <- track_plot + layer_spatial(
+      feat_lines, 
+      aes(col=plot_color),
+      alpha=0.5)
+  }
+  
+  return(track_plot)
+}
+
+# get observation segments
+for (observation_path in unique(validation_data$observation_path)[1:3]) {
+  # some preprocessing for ggplot2
+  observation <- validation_data[validation_data$observation_path == observation_path,]
+  observation$behaviour <- as.factor(observation$behaviour)
+  
+  observation_interval <- interval(min(observation$time), max(observation$time))
+  localisations <- training_data[training_data$tag == observation$tag[1],]
+  localisations <- training_data[training_data$time %within% observation_interval,]
+  # TODO this really shouldn't happen if we use all the training data
+  if (nrow(localisations) == 0) next
+  
+  observation$plot_color <- observation$pure_behaviour
+  localisations$plot_color <- localisations$pred_state
+  
+  feat_observation <- st_as_sf(observation, coords=c('X','Y'), crs=32631)
+  feat_prediction <- st_as_sf(localisations, coords=c('X','Y'), crs=32631)
+  feat_prediction_linestrings <- get_linestrings(localisations)
+  
+  feat_observation$plot_color <- observation$pure_behaviour
+  feat_prediction$plot_color <- localisations$pred_state
+  feat_prediction_linestrings$plot_color <- as.factor(feat_prediction_linestrings$pred_state)
+  
+  plot_location <- get_location_plot(localisations)
+  plot_observation <- get_behaviour_track_plot(
+    "Observed State",
+    feat_points = feat_observation
   )
-  segment_linestring <- segment_linestring[segment_linestring$multiple_points == T,]
-  segment_linestring <- st_set_crs(segment_linestring, 32631)
-  return(segment_linestring)
+  plot_prediction <- get_behaviour_track_plot(
+    "Predicted State",
+    feat_points = feat_prediction,
+    feat_lines = feat_prediction_linestrings
+  )
+
+  grid.arrange(
+    plot_location,
+    plot_observation, 
+    plot_prediction
+  )
+}
 ```
+
+# Validation Analytics
+```{r}
+validation_stats <- data.frame()
+
+# validating the validation: check the following
+# n predicted localisations should be the same as n observed localisations
+# time of localisations should be the same as time of observed localisations
+
+get_percent_behaviour <- function(data, column, behaviour) {
+  return(nrow(data[data[,column] == behaviour,]) / nrow(data))
+}
+
+# for each behaviour - calculate true positive + false positive as well as percentages
+for (observation_path in unique(validation_data$observation_path)[1:3]) {
+  # some preprocessing for ggplot2
+  observation <- validation_data[validation_data$observation_path == observation_path,]
+  observation$behaviour <- as.factor(observation$behaviour)
+  
+  observation_interval <- interval(min(observation$time), max(observation$time))
+  localisations <- training_data[training_data$tag == observation$tag[1],]
+  localisations <- training_data[training_data$time %within% observation_interval,]
+  # TODO this really shouldn't happen if we use all the training data
+  if (nrow(localisations) == 0) next
+  if (nrow(localisations) != nrow(observation)) 
+    print("Different amount of predictions and observations")
+  
+  obs_percent_active <- get_percent_behaviour(observation, 'pure_behaviour', 'active')
+  obs_percent_inactive <- get_percent_behaviour(observation, 'pure_behaviour', 'inactive')
+  obs_percent_flying <- get_percent_behaviour(observation, 'pure_behaviour', 'flying')
+  
+  pred_percent_active <- get_percent_behaviour(localisations, 'pred_state', 'active')
+  pred_percent_inactive <- get_percent_behaviour(localisations, 'pred_state', 'inactive')
+  pred_percent_flying <- get_percent_behaviour(localisations, 'pred_state', 'flying')
+    
+  validation_stats <- bind_rows(
+      validation_stats,
+      data.frame(
+        id=observation_path,
+        obs_percent_active=obs_percent_active,
+        obs_percent_inactive=obs_percent_inactive,
+        obs_percent_flying=obs_percent_flying,
+        pred_percent_active=pred_percent_active,
+        pred_percent_inactive=pred_percent_inactive,
+        pred_percent_flying=pred_percent_flying
+      )
+    )
+}
+```
+
+```{r}
+m_active <- lm(obs_percent_active ~ pred_percent_active, data=validation_stats)
+plot(obs_percent_active ~ pred_percent_active, data=validation_stats)
+abline(m_active)
+```
+
+
 
 
 
